@@ -444,8 +444,12 @@ const VoiceStateRouting = {
             const leavePlayer = remix.players.playerMap.get(cleanOld);
             if (leavePlayer && !leavePlayer.leaving && !leavePlayer._destroyed) {
               logger.voiceState(
-                  `[VoiceState] Bot disconnected from ${cleanOld} (24/7 mode: ${mode}) — emitting autoleave.`
+                  `[VoiceState] Bot disconnected from ${cleanOld} (24/7 mode: ${mode}) — evicting stale player and emitting autoleave.`
               );
+              const homeChannel = cleanId(leavePlayer._home247Channel ?? "");
+              remix.players.playerMap.delete(cleanOld);
+              if (homeChannel && homeChannel !== cleanOld) remix.players.playerMap.delete(homeChannel);
+              try { remix.players._unindexPlayer?.(leavePlayer._guildId, cleanOld); } catch (_) {}
               leavePlayer.emit("autoleave");
             }
           }

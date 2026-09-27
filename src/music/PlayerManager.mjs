@@ -18,6 +18,7 @@ import { getMessageGuildId } from "../ui/index.mjs";
 import { applyMixins } from "../utils/mixins.mjs";
 import PlayerEventsMixin, { getPlayerChannelId } from "./PlayerEventsMixin.mjs";
 import PlayerLifecycleMixin from "./PlayerLifecycleMixin.mjs";
+import { isPlayerConnectionDead, detachPlayerFromManager } from "../utils/Helpers247.mjs";
 
 
 /** @class PlayerManager @description Manages all Player instances. Handles player lifecycle (spawn, join, leave, destroy), voice channel resolution, dashboard events, and autoleave suppression for 24/7 channels. */
@@ -168,6 +169,28 @@ export class PlayerManager {
     return false;
   }
 
+  /**
+   * Evict `player` from playerMap/index/scrobble-timers and destroy it if its
+   * underlying voice connection is dead. Zombie players (still mapped, but
+   * disconnected from LiveKit — e.g. after a manual voice-kick that the
+   * autoleave suppression rules chose not to clean up) must never be handed
+   * back to a command as if they were live; every caller that fetches an
+   * "existing" player from playerMap should run it through this check first.
+   * @param {Player|null} player
+   * @param {string|null} [fallbackChannelId=null]
+   * @returns {boolean} True if the player was dead and has been evicted.
+   */
+  _evictIfDead(player, fallbackChannelId = null) {
+    if (!player || !isPlayerConnectionDead(player)) return false;
+    logger.voice247(
+        `[PlayerManager] getPlayer() found a zombie player (channel ${fallbackChannelId ?? player?._channelId}) — evicting.`
+    );
+    const remix = this.commands?.client?._remix ?? null;
+    detachPlayerFromManager(remix ?? { players: this }, player, fallbackChannelId);
+    try { player.destroy(); } catch (_) {}
+    return true;
+  }
+
   /** Find a player by its channel ID across all guilds. @param {string} channelId @returns {Player|null} */
  getPlayerByChannelId(channelId) {
     const cId = cleanId(channelId);
@@ -191,7 +214,8 @@ export class PlayerManager {
     if (cleanUserChannelId) {
       const player = this.playerMap.get(cleanUserChannelId)
           ?? this.getPlayerByGuildAndChannel(cleanGuildId, cleanUserChannelId);
-      if (player) {
+      if (player && this._evictIfDead(player, cleanUserChannelId)) {
+      } else if (player) {
         player.textChannel = message.channel?.channel ?? message.channel;
         try {
           const textChannelId = message?.channel?.id ?? message?.channel?.channel?.id ?? null;
@@ -208,9 +232,8 @@ export class PlayerManager {
       }
     }
 
-    const serverPlayers = cleanGuildId
-        ? this.getGuildPlayers(cleanGuildId)
-        : [];
+    const serverPlayers = (cleanGuildId ? this.getGuildPlayers(cleanGuildId) : [])
+        .filter(([chId, player]) => !this._evictIfDead(player, chId));
 
     if (serverPlayers.length > 0) {
       const channelList = serverPlayers.map(([chId]) => `<#${chId}>`).join(" or ");
