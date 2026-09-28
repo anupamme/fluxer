@@ -11,8 +11,11 @@ import HttpStreams from "./HttpStreams.mjs";
 /** @type {number} @description livekit TrackKind.KIND_AUDIO — publications with this kind are managed by the bridge. */
 const TRACK_KIND_AUDIO = 1;
 
-/** @type {WeakMap<object, Set<string>>} @description Audio SIDs already handed to LiveKit for unpublish, keyed per local participant. LiveKit's unpublishTrack() is async — the publication stays listed in trackPublications until the RTC layer completes it, so repeated sweeps (stop() -> play() -> stop()) re-unpublish the same SID, producing duplicate "Unpublished stale audio track" logs and LiveKit "RoomEvent.LocalTrackSubscribed: Publication not found" warnings. The WeakMap GCs itself when the participant is destroyed. */
+/** @type {WeakMap<object, Map<string, Promise<void>>>} @description Audio SIDs currently being unpublished from LiveKit, keyed per local participant, mapped to a promise that resolves once that specific unpublish settles. LiveKit's unpublishTrack() is async — the publication stays listed in trackPublications until the RTC layer completes it, so repeated sweeps (stop() -> play() -> stop()) would otherwise re-unpublish the same SID, producing duplicate "Unpublished stale audio track" logs and LiveKit "RoomEvent.LocalTrackSubscribed: Publication not found" warnings. Beyond dedup, play() now also awaits these promises before publishing a new track (see _awaitPendingUnpublishes): without that wait, stop()'s fire-and-forget unpublish of the previous track could still be in flight when the next track's publish lands, briefly overlapping two audio publications on the same participant — heard as static/garbled audio until the stale one finished tearing down (fixed by a manual pause/resume, which forces a clean renegotiation). Entries remove themselves once their unpublish settles, so the map cannot grow unbounded across a 24/7 session. The WeakMap GCs itself when the participant is destroyed. */
 const pendingUnpublishSids = new WeakMap();
+
+/** @type {number} @description Max time to wait for a stale-track unpublish to settle before publishing anyway (defensive — an unpublish should resolve almost instantly; this only guards against a hung/never-resolving LiveKit promise blocking playback indefinitely). */
+const UNPUBLISH_WAIT_TIMEOUT_MS = 1200;
 
 /** @extends {EventEmitter} */
 export class FluxerAudioBridge extends EventEmitter {
@@ -87,6 +90,9 @@ export class FluxerAudioBridge extends EventEmitter {
     this._startedAt = Date.now();
     this._currentUri = trackInfo?.url ?? trackInfo?.title ?? "unknown";
     this._usedTrackstream = false;
+
+    await this._awaitPendingUnpublishes(conn);
+    if (generation !== this._playGeneration) return "stopped";
 
     const seekMs = Math.floor((options.seekSeconds ?? 0) * 1000);
     let durationMs = options.durationMs || 0;
@@ -501,36 +507,61 @@ export class FluxerAudioBridge extends EventEmitter {
       const publications = participant.trackPublications;
       if (!publications || typeof publications.entries !== "function") return;
 
-      // One guard set per participant, shared by every bridge instance in this
-      // process: a SID currently being unpublished is skipped by later sweeps.
-      let seen = pendingUnpublishSids.get(participant);
-      if (!seen) {
-        seen = new Set();
-        pendingUnpublishSids.set(participant, seen);
+      // One guard map per participant, shared by every bridge instance in this
+      // process: a SID currently being unpublished is skipped by later sweeps,
+      // and its promise is awaitable via _awaitPendingUnpublishes().
+      let pending = pendingUnpublishSids.get(participant);
+      if (!pending) {
+        pending = new Map();
+        pendingUnpublishSids.set(participant, pending);
       }
-
-      // Prune SIDs whose publications are gone (unpublish completed) so the
-      // guard set cannot grow unbounded across a 24/7 session.
-      try {
-        if (typeof publications.has === "function") {
-          for (const sid of seen) {
-            if (!publications.has(sid)) seen.delete(sid);
-          }
-        }
-      } catch (_) {}
 
       for (const [sid, pub] of publications.entries()) {
         if (keepSid && sid === keepSid) continue;
         if (pub?.kind !== TRACK_KIND_AUDIO) continue;
-        if (seen.has(sid)) continue;
+        if (pending.has(sid)) continue;
         try {
-          seen.add(sid);
-          const p = participant.unpublishTrack(sid, true);
-          if (p?.catch) p.catch(() => seen.delete(sid)); // failed unpublish -> allow retry
+          const settle = Promise.resolve(participant.unpublishTrack(sid, true))
+              .catch(() => {}) // failed unpublish is still a settled state — don't block on it
+              .finally(() => { if (pending.get(sid) === settle) pending.delete(sid); });
+          pending.set(sid, settle);
           logger.player("[AudioBridge] Unpublished stale audio track: " + sid);
         } catch (_) {
-          seen.delete(sid);
+          pending.delete(sid);
         }
+      }
+    } catch (_) {
+    }
+  }
+
+  /**
+   * Wait for any in-flight unpublishes on `conn`'s participant to settle
+   * (bounded by UNPUBLISH_WAIT_TIMEOUT_MS) before the caller publishes a new
+   * track. Without this, a fire-and-forget unpublish from the previous
+   * stop() can still be tearing down when the next track's publish lands,
+   * briefly overlapping two audio publications — heard as static/garbled
+   * audio at the start of the next track.
+   * @param {object} conn - Fluxer voice connection
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _awaitPendingUnpublishes(conn) {
+    try {
+      const participant = conn?.room?.localParticipant;
+      if (!participant) return;
+      const pending = pendingUnpublishSids.get(participant);
+      if (!pending || pending.size === 0) return;
+
+      const waits = [...pending.values()];
+      let timedOut = false;
+      const timeout = new Promise((resolve) => {
+        setTimeout(() => { timedOut = true; resolve(); }, UNPUBLISH_WAIT_TIMEOUT_MS).unref?.();
+      });
+      await Promise.race([Promise.allSettled(waits), timeout]);
+      if (timedOut) {
+        logger.warn(
+            `[AudioBridge] Timed out waiting for ${waits.length} stale unpublish(es) to settle after ${UNPUBLISH_WAIT_TIMEOUT_MS}ms — publishing new track anyway.`
+        );
       }
     } catch (_) {
     }
