@@ -63,6 +63,19 @@ export class VoiceStateCache {
     const maxEntries  = isBot ? this._maxBots        : this._maxUsers;
     const uKey        = VoiceStateCache.userKey(cleanGuild, cleanUser);
 
+    const otherLocations  = isBot ? this.userLocations  : this.botLocations;
+    const otherChannelIdx = isBot ? this.channelMembers : this.botChannelMembers;
+    const otherPrev = otherLocations.get(uKey);
+    if (otherPrev) {
+      const otherPrevCKey = VoiceStateCache.channelKey(otherPrev.guildId, otherPrev.channelId);
+      const otherPrevSet  = otherChannelIdx.get(otherPrevCKey);
+      if (otherPrevSet) {
+        otherPrevSet.delete(cleanUser);
+        if (otherPrevSet.size === 0) otherChannelIdx.delete(otherPrevCKey);
+      }
+      otherLocations.delete(uKey);
+    }
+
     const prev = locations.get(uKey);
     if (prev) {
       const prevCKey = VoiceStateCache.channelKey(prev.guildId, prev.channelId);

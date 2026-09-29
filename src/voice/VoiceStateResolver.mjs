@@ -168,6 +168,34 @@ export function hasHumansInChannel({ guildId, channelId, client, voiceCache, obs
 export function countHumansInChannel({ guildId, channelId, client, voiceCache, observedVoiceUsers, botId }) {
   if (!channelId || !guildId) return 0;
 
+  if (voiceCache && typeof voiceCache.getHumansInChannel === "function") {
+    const cachedHumans = voiceCache.getHumansInChannel(guildId, channelId);
+
+    if (client) {
+      let guild = null;
+      try { guild = client.guilds?.get?.(guildId); } catch (_) { guild = null; }
+
+      let humanCount = 0;
+      for (const userId of cachedHumans) {
+        const isBot = resolveIsBotUser({
+          userId,
+          member: guild?.members?.get?.(userId) ?? null,
+          guild,
+          client,
+          botId,
+        });
+        if (isBot) {
+          try { voiceCache.updateUser({ guildId, userId, channelId, isBot: true }); } catch (_) {}
+        } else {
+          humanCount++;
+        }
+      }
+      return humanCount;
+    }
+
+    return cachedHumans.length;
+  }
+
   if (voiceCache && typeof voiceCache.getHumanCount === "function") {
     return voiceCache.getHumanCount(guildId, channelId);
   }
